@@ -1,0 +1,25 @@
+node_modules/
+dist/
+.env
+.env.local
+.auth/
+
+# Playwright outputs
+test-results/
+playwright-report/
+playwright/.cache/
+blob-report/
+
+# Allure outputs
+allure-results/
+allure-report/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Logs
+*.log
+npm-debug.log*
