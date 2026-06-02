@@ -1,0 +1,162 @@
+name: Playwright Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    # Nightly regression run at 02:00 UTC
+    - cron: '0 2 * * *'
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  test:
+    name: Run Playwright tests
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [chromium, api]
+        # project: [chromium, firefox, webkit, api]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browsers
+        run: |
+          npx playwright install --with-deps chromium
+          if [[ "${{ matrix.project }}" == "firefox" || "${{ matrix.project }}" == "webkit" ]]; then
+            npx playwright install --with-deps ${{ matrix.project }}
+          fi
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Start application stack
+        run: docker compose -f docker-compose.ci.yml up -d
+
+      - name: Wait for database
+        run: |
+          for i in $(seq 1 30); do
+            if docker compose -f docker-compose.ci.yml exec -T mariadb \
+              mysqladmin ping -h localhost -u root -proot --silent 2>/dev/null; then
+              echo "MariaDB ready"; exit 0
+            fi
+            sleep 2
+          done
+          docker compose -f docker-compose.ci.yml logs mariadb
+          exit 1
+
+      - name: Seed database
+        run: docker compose -f docker-compose.ci.yml exec -T -w /var/www laravel-api php artisan migrate:refresh --seed
+
+      - name: Wait for API
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8091/status >/dev/null; then echo "API ready"; exit 0; fi
+            sleep 2
+          done
+          docker compose -f docker-compose.ci.yml logs laravel-api web
+          exit 1
+
+      - name: Wait for UI
+        if: matrix.project != 'api'
+        run: |
+          for i in $(seq 1 60); do
+            if [ "$(curl -s -o /dev/null -w '%{http_code}' http://localhost:4200)" = "200" ]; then
+              echo "UI ready"; exit 0
+            fi
+            sleep 5
+          done
+          docker compose -f docker-compose.ci.yml logs angular-ui
+          exit 1
+
+      - name: Run tests
+        env:
+          BASE_URL: http://localhost:4200
+          API_BASE_URL: http://localhost:8091
+        run: npx playwright test --project=${{ matrix.project }}
+
+      - name: Upload Playwright HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ matrix.project }}
+          path: playwright-report/
+          retention-days: 14
+
+      - name: Upload Allure results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results-${{ matrix.project }}
+          path: allure-results/
+          retention-days: 14
+
+  publish-allure:
+    name: Publish Allure report
+    needs: test
+    if: always() && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download all Allure results
+        uses: actions/download-artifact@v4
+        with:
+          pattern: allure-results-*
+          path: allure-results-all
+          merge-multiple: true
+
+      - name: Move merged results
+        run: |
+          mkdir -p allure-results
+          cp -r allure-results-all/* allure-results/ 2>/dev/null || true
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Install Allure CLI
+        run: |
+          curl -o allure.tgz -L https://github.com/allure-framework/allure2/releases/download/2.30.0/allure-2.30.0.tgz
+          tar -xzf allure.tgz
+          sudo mv allure-2.30.0 /opt/allure
+          sudo ln -s /opt/allure/bin/allure /usr/local/bin/allure
+
+      - name: Generate Allure report
+        run: allure generate allure-results --clean -o allure-report
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: allure-report
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4
